@@ -1,6 +1,10 @@
 # Token Lens
 
-![Token Lens Codex usage example](docs/assets/codex_usage_agentic.webp)
+<p align="center">
+  <img src="docs/assets/codex_usage_agentic.webp"
+       alt="Token Lens Codex usage example"
+       width="50%" height="50%">
+</p>
 
 Token Lens is a CLI toolkit for inspecting Codex token usage at turn/task level.
 
