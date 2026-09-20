@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -u
+
+SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-usage T-xxxxxxxx
+  codex-usage <full-turn-id>
+  codex-usage T-xxxxxxxx --json
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+command -v jq >/dev/null 2>&1 || die "jq is required."
+command -v rg >/dev/null 2>&1 || die "ripgrep (rg) is required."
+[[ -d "$SESSIONS_DIR" ]] || die "Codex sessions directory not found: $SESSIONS_DIR"
+
+requested="${1:-}"
+output_mode="${2:-}"
+
+[[ -n "$requested" ]] || { usage; exit 1; }
+
+turn_id=""
+
+if [[ "$requested" == T-* ]]; then
+  suffix="${requested#T-}"
+
+  matches="$(
+    rg -l --fixed-strings "$suffix" "$SESSIONS_DIR" -g '*.jsonl' 2>/dev/null |
+    while IFS= read -r file; do
+      jq -r --arg suffix "$suffix" '
+        select(.type == "token_usage_record")
+        | .payload.turn_id
+        | select(type == "string" and endswith($suffix))
+      ' "$file" 2>/dev/null
+    done |
+    sed '/^$/d' |
+    sort -u
+  )"
+
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+  [[ "$count" -gt 0 ]] || die "Short ID not found: $requested"
+
+  if [[ "$count" -gt 1 ]]; then
+    echo "Short ID is ambiguous:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+  fi
+
+  turn_id="$matches"
+else
+  turn_id="$requested"
+fi
+
+short="T-${turn_id: -8}"
+
+hit="$(
+  rg -l --fixed-strings "$turn_id" "$SESSIONS_DIR" -g '*.jsonl' 2>/dev/null |
+  head -1
+)"
+
+[[ -n "$hit" ]] || die "Turn ID not found: $turn_id"
+
+root="$(
+  jq -r --arg id "$turn_id" '
+    select(
+      .type == "token_usage_record"
+      and .payload.turn_id == $id
+    )
+    | (.payload.root_turn_id // .payload.turn_id)
+  ' "$hit" 2>/dev/null |
+  tail -1
+)"
+
+[[ -n "$root" && "$root" != "null" ]] || root="$turn_id"
+
+tmp="$(mktemp -t codex-usage.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+rg -l --fixed-strings "$root" "$SESSIONS_DIR" -g '*.jsonl' 2>/dev/null |
+while IFS= read -r file; do
+  jq -c --arg root "$root" '
+    select(
+      .type == "token_usage_record"
+      and (
+        ((.payload.root_turn_id // .payload.turn_id) == $root)
+        or (.payload.turn_id == $root)
+      )
+    )
+  ' "$file" 2>/dev/null
+done > "$tmp"
+
+[[ -s "$tmp" ]] || die "No token usage records found for root turn: $root"
+
+report="$(
+  jq -s \
+    --arg id "$turn_id" \
+    --arg short "$short" \
+    --arg root "$root" '
+      group_by(.payload.turn_id)
+      | map(max_by(.timestamp))
+      | . as $records
+      | (
+          $records
+          | map(select(.payload.turn_id == $id))
+          | first
+        ) as $selected
+      | {
+          id: {
+            short_id: $short,
+            turn_id: $id,
+            root_turn_id: $root,
+            session_id: ($selected.payload.session_id // null)
+          },
+          selected_turn:
+            (
+              if $selected == null then null
+              else
+                ($selected.payload.turn_token_usage // {}) as $t
+                | $t + {
+                    uncached_input_tokens:
+                      (($t.input_tokens // 0) - ($t.cached_input_tokens // 0)),
+                    effective_used_tokens:
+                      (
+                        ($t.input_tokens // 0)
+                        - ($t.cached_input_tokens // 0)
+                        + ($t.output_tokens // 0)
+                      ),
+                    cache_ratio_percent:
+                      (
+                        if ($t.input_tokens // 0) > 0
+                        then (
+                          ((($t.cached_input_tokens // 0) / $t.input_tokens) * 100)
+                          | round
+                        )
+                        else 0
+                        end
+                      )
+                  }
+              end
+            ),
+          whole_task: {
+            turns: ($records | length),
+            sessions:
+              (
+                $records
+                | map(.payload.session_id)
+                | map(select(. != null))
+                | unique
+                | length
+              ),
+            input_tokens:
+              (
+                $records
+                | map(.payload.turn_token_usage.input_tokens // 0)
+                | add // 0
+              ),
+            cached_input_tokens:
+              (
+                $records
+                | map(.payload.turn_token_usage.cached_input_tokens // 0)
+                | add // 0
+              ),
+            uncached_input_tokens:
+              (
+                $records
+                | map(
+                    (.payload.turn_token_usage.input_tokens // 0)
+                    - (.payload.turn_token_usage.cached_input_tokens // 0)
+                  )
+                | add // 0
+              ),
+            output_tokens:
+              (
+                $records
+                | map(.payload.turn_token_usage.output_tokens // 0)
+                | add // 0
+              ),
+            reasoning_output_tokens:
+              (
+                $records
+                | map(.payload.turn_token_usage.reasoning_output_tokens // 0)
+                | add // 0
+              ),
+            effective_used_tokens:
+              (
+                $records
+                | map(
+                    (.payload.turn_token_usage.input_tokens // 0)
+                    - (.payload.turn_token_usage.cached_input_tokens // 0)
+                    + (.payload.turn_token_usage.output_tokens // 0)
+                  )
+                | add // 0
+              )
+          }
+        }
+    ' "$tmp"
+)" || die "Failed to build report."
+
+if [[ "$output_mode" == "--json" ]]; then
+  printf '%s\n' "$report" | jq .
+  exit 0
+fi
+
+effective="$(printf '%s\n' "$report" | jq -r '.whole_task.effective_used_tokens')"
+uncached="$(printf '%s\n' "$report" | jq -r '.whole_task.uncached_input_tokens')"
+cache_ratio="$(printf '%s\n' "$report" | jq -r 'if .whole_task.input_tokens > 0 then (((.whole_task.cached_input_tokens / .whole_task.input_tokens) * 100) | round) else 0 end')"
+input="$(printf '%s\n' "$report" | jq -r '.whole_task.input_tokens')"
+reasoning="$(printf '%s\n' "$report" | jq -r '.whole_task.reasoning_output_tokens')"
+turns="$(printf '%s\n' "$report" | jq -r '.whole_task.turns')"
+
+rate_low_better() {
+  value="$1"; great="$2"; good="$3"; watch="$4"
+  if (( value < great )); then
+    printf '0|🟢 GREAT'
+  elif (( value < good )); then
+    printf '1|🔵 GOOD'
+  elif (( value < watch )); then
+    printf '2|🟡 WATCH'
+  else
+    printf '3|🔴 BAD'
+  fi
+}
+
+rate_cache() {
+  value="$1"
+  if (( value >= 85 )); then
+    printf '0|🟢 GREAT'
+  elif (( value >= 70 )); then
+    printf '1|🔵 GOOD'
+  elif (( value >= 50 )); then
+    printf '2|🟡 WATCH'
+  else
+    printf '3|🔴 BAD'
+  fi
+}
+
+rate_turns() {
+  value="$1"
+  if (( value == 1 )); then
+    printf '0|🟢 GREAT'
+  elif (( value == 2 )); then
+    printf '1|🔵 GOOD'
+  elif (( value <= 4 )); then
+    printf '2|🟡 WATCH'
+  else
+    printf '3|🔴 BAD'
+  fi
+}
+
+r1="$(rate_low_better "$effective" 2000 5000 10000)"
+r2="$(rate_low_better "$uncached" 2000 5000 10000)"
+r3="$(rate_cache "$cache_ratio")"
+r4="$(rate_low_better "$input" 15000 25000 50000)"
+r5="$(rate_low_better "$reasoning" 101 501 2001)"
+r6="$(rate_turns "$turns")"
+
+s1="${r1%%|*}"; l1="${r1#*|}"
+s2="${r2%%|*}"; l2="${r2#*|}"
+s3="${r3%%|*}"; l3="${r3#*|}"
+s4="${r4%%|*}"; l4="${r4#*|}"
+s5="${r5%%|*}"; l5="${r5#*|}"
+s6="${r6%%|*}"; l6="${r6#*|}"
+
+overall=0
+for score in "$s1" "$s2" "$s3" "$s4" "$s5" "$s6"; do
+  (( score > overall )) && overall="$score"
+done
+
+case "$overall" in
+  0) overall_label="🟢 GREAT" ;;
+  1) overall_label="🔵 GOOD" ;;
+  2) overall_label="🟡 WATCH" ;;
+  *) overall_label="🔴 BAD" ;;
+esac
+
+echo
+echo "Codex Token Health"
+echo "────────────────────────────────────────────────────────────"
+echo "Turn: $short"
+echo
+
+printf "%-4s %-34s %12s   %s\n" "#" "METRIC" "VALUE" "RATING"
+printf "%-4s %-34s %12s   %s\n" "1" "effective_used_tokens" "$effective" "$l1"
+printf "%-4s %-34s %12s   %s\n" "2" "uncached_input_tokens" "$uncached" "$l2"
+printf "%-4s %-34s %11s%%   %s\n" "3" "cache_ratio_percent" "$cache_ratio" "$l3"
+printf "%-4s %-34s %12s   %s\n" "4" "input_tokens" "$input" "$l4"
+printf "%-4s %-34s %12s   %s\n" "5" "reasoning_output_tokens" "$reasoning" "$l5"
+printf "%-4s %-34s %12s   %s\n" "6" "turns" "$turns" "$l6"
+
+echo
+echo "────────────────────────────────────────────────────────────"
+echo "OVERALL: $overall_label"
+echo
+echo "Criteria (simple / efficient task)"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "#" "METRIC" "GREAT" "GOOD" "WATCH" "BAD"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "1" "Effective" "<2K" "2K-5K" "5K-10K" ">=10K"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "2" "Uncached" "<2K" "2K-5K" "5K-10K" ">=10K"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "3" "Cache" ">=85%" "70-84%" "50-69%" "<50%"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "4" "Input" "<15K" "15K-25K" "25K-50K" ">=50K"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "5" "Reasoning" "0-100" "101-500" "501-2000" ">2000"
+printf "  %-3s %-12s %-12s %-12s %-12s %-12s\n" "6" "Turns" "1" "2" "3-4" ">=5"
+echo
+echo "Legend: 🟢 GREAT   🔵 GOOD   🟡 WATCH   🔴 BAD"
