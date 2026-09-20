@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -u
+
+SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  codex-turns [limit]
+  codex-turns --limit <n>
+  codex-turns [limit] --json
+
+Lists the most recent unique Codex turns from ~/.codex/sessions.
+USAGE
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+command -v jq >/dev/null 2>&1 || die "jq is required."
+[[ -d "$SESSIONS_DIR" ]] || die "Codex sessions directory not found: $SESSIONS_DIR"
+
+limit=10
+output_mode="table"
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --json)
+      output_mode="json"
+      shift
+      ;;
+    -n|--limit)
+      (( $# >= 2 )) || die "$1 requires a value."
+      limit="$2"
+      shift 2
+      ;;
+    *[!0-9]*|'')
+      die "Unknown argument: $1"
+      ;;
+    *)
+      limit="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ "$limit" =~ ^[1-9][0-9]*$ ]] || die "Limit must be a positive integer."
+
+tmp="$(mktemp -t codex-turns.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+while IFS= read -r -d '' file; do
+  jq -r '
+    select(.type == "token_usage_record")
+    | select(.payload.turn_id | type == "string")
+    | [
+        (.timestamp // ""),
+        ("T-" + .payload.turn_id[-8:]),
+        .payload.turn_id,
+        (.payload.root_turn_id // .payload.turn_id),
+        ("T-" + ((.payload.root_turn_id // .payload.turn_id)[-8:])),
+        (.payload.session_id // "")
+      ]
+    | @tsv
+  ' "$file" 2>/dev/null
+done < <(find "$SESSIONS_DIR" -type f -name '*.jsonl' -print0) \
+  | sort -r \
+  | awk -F '\t' '!seen[$3]++' \
+  | head -"$limit" > "$tmp"
+
+if [[ "$output_mode" == "json" ]]; then
+  jq -Rn '
+    [inputs
+      | split("\t")
+      | {
+          timestamp: .[0],
+          short_id: .[1],
+          turn_id: .[2],
+          root_turn_id: .[3],
+          short_root_id: .[4],
+          session_id: .[5]
+        }
+    ]
+  ' < "$tmp"
+  exit 0
+fi
+
+printf "%-22s %-11s %-11s %-38s %-38s\n" \
+  "TIME" "SHORT-ID" "ROOT-ID" "SESSION-ID" "TURN-ID"
+
+while IFS=$'\t' read -r ts short turn root short_root session; do
+  [[ -n "$turn" ]] || continue
+  printf "%-22s %-11s %-11s %-38s %-38s\n" \
+    "$ts" "$short" "$short_root" "${session:--}" "$turn"
+done < "$tmp"
