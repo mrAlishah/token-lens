@@ -1,0 +1,47 @@
+{
+  "default_profile": "coding",
+  "profiles": {
+    "coding": {
+      "criteria": {
+        "effective_used_tokens": {
+          "great_lt": 8000,
+          "good_lt": 20000,
+          "watch_lt": 50000
+        },
+        "uncached_input_tokens": {
+          "great_lt": 6000,
+          "good_lt": 15000,
+          "watch_lt": 35000
+        },
+        "cache_ratio_percent": {
+          "great_gte": 80,
+          "good_gte": 60,
+          "watch_gte": 35
+        },
+        "input_tokens": {
+          "great_lt": 50000,
+          "good_lt": 150000,
+          "watch_lt": 300000
+        },
+        "reasoning_output_tokens": {
+          "great_lt": 1000,
+          "good_lt": 4000,
+          "watch_lt": 12000
+        },
+        "turns": {
+          "great_lte": 3,
+          "good_lte": 8,
+          "watch_lte": 15
+        }
+      },
+      "weights": {
+        "effective_used_tokens": 30,
+        "uncached_input_tokens": 25,
+        "cache_ratio_percent": 20,
+        "input_tokens": 10,
+        "reasoning_output_tokens": 10,
+        "turns": 5
+      }
+    }
+  }
+}
