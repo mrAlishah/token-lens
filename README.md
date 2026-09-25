@@ -2,8 +2,7 @@
 
 <p align="center">
   <img src="docs/assets/codex_usage_agentic.webp"
-       alt="Token Lens Codex usage example"
-       width="50%" height="50%">
+       alt="Token Lens Codex usage example">
 </p>
 
 Token Lens is a local CLI toolkit for inspecting token usage from **Codex** and **Claude Code** at turn/session level.
