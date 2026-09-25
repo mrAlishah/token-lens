@@ -98,6 +98,17 @@ if [[ "$config_mode" != "disabled" ]]; then
 fi
 load_profile "$profile"
 
+# Recommended health defaults are separate from the legacy size-oriented criteria.
+H_CONTEXT_WINDOW=200000
+H_CACHE_MIN_TURNS=3
+H_CACHE_MIN_INPUT=20000
+H_CACHE_G=75; H_CACHE_O=50; H_CACHE_W=25
+case "$profile" in
+  simple) H_COST_G=30000; H_COST_O=75000; H_COST_W=150000; H_LOOP_G=8; H_LOOP_O=20; H_LOOP_W=40 ;;
+  coding) H_COST_G=60000; H_COST_O=150000; H_COST_W=300000; H_LOOP_G=16; H_LOOP_O=40; H_LOOP_W=80 ;;
+  agentic) H_COST_G=120000; H_COST_O=300000; H_COST_W=600000; H_LOOP_G=30; H_LOOP_O=80; H_LOOP_W=160 ;;
+esac
+
 config_value() {
   local path="$1"
   [[ "$config_source" != "built-in defaults" ]] || return 0
@@ -134,8 +145,20 @@ apply_override W_U weights.uncached_input_tokens
 apply_override W_C weights.cache_ratio_percent
 apply_override W_I weights.input_tokens
 apply_override W_T weights.turns
+apply_override H_CONTEXT_WINDOW health.context_window_tokens
+apply_override H_COST_G health.cost_equivalent_per_turn.great_lt
+apply_override H_COST_O health.cost_equivalent_per_turn.good_lt
+apply_override H_COST_W health.cost_equivalent_per_turn.watch_lt
+apply_override H_LOOP_G health.loop_turns.great_lte
+apply_override H_LOOP_O health.loop_turns.good_lte
+apply_override H_LOOP_W health.loop_turns.watch_lte
+apply_override H_CACHE_G health.cache_ratio_percent.great_gte
+apply_override H_CACHE_O health.cache_ratio_percent.good_gte
+apply_override H_CACHE_W health.cache_ratio_percent.watch_gte
+apply_override H_CACHE_MIN_TURNS health.cache_ratio_percent.min_turns
+apply_override H_CACHE_MIN_INPUT health.cache_ratio_percent.min_input_tokens
 
-for value in "$E_G" "$E_O" "$E_W" "$U_G" "$U_O" "$U_W" "$C_G" "$C_O" "$C_W" "$I_G" "$I_O" "$I_W" "$T_G" "$T_O" "$T_W" "$W_E" "$W_U" "$W_C" "$W_I" "$W_T"; do
+for value in "$E_G" "$E_O" "$E_W" "$U_G" "$U_O" "$U_W" "$C_G" "$C_O" "$C_W" "$I_G" "$I_O" "$I_W" "$T_G" "$T_O" "$T_W" "$W_E" "$W_U" "$W_C" "$W_I" "$W_T" "$H_CONTEXT_WINDOW" "$H_COST_G" "$H_COST_O" "$H_COST_W" "$H_LOOP_G" "$H_LOOP_O" "$H_LOOP_W" "$H_CACHE_G" "$H_CACHE_O" "$H_CACHE_W" "$H_CACHE_MIN_TURNS" "$H_CACHE_MIN_INPUT"; do
   [[ "$value" =~ ^[0-9]+$ ]] || die "Criteria and weights must be non-negative integers."
 done
 (( E_G < E_O && E_O < E_W )) || die "Invalid Effective thresholds for profile: $profile"
@@ -144,6 +167,10 @@ done
 (( I_G < I_O && I_O < I_W )) || die "Invalid Input thresholds for profile: $profile"
 (( T_G < T_O && T_O < T_W )) || die "Invalid Turns thresholds for profile: $profile"
 (( W_E > 0 && W_U > 0 && W_C > 0 && W_I > 0 && W_T > 0 )) || die "All metric weights must be positive."
+(( H_CONTEXT_WINDOW > 0 )) || die "health.context_window_tokens must be positive."
+(( H_COST_G < H_COST_O && H_COST_O < H_COST_W )) || die "Invalid recommended cost thresholds for profile: $profile"
+(( H_LOOP_G < H_LOOP_O && H_LOOP_O < H_LOOP_W )) || die "Invalid recommended loop thresholds for profile: $profile"
+(( H_CACHE_G > H_CACHE_O && H_CACHE_O > H_CACHE_W )) || die "Invalid recommended cache thresholds for profile: $profile"
 
 needle="$requested"
 [[ "$needle" == T-* ]] && needle="${needle#T-}"
@@ -252,6 +279,30 @@ models="$(jq -r '.whole_session.models | join(", ")' <<<"$report")"
 cache_ratio=0
 (( input > 0 )) && cache_ratio=$(( cache_read * 100 / input ))
 
+max_turn_input="$(jq -s '
+  def fresh($u): (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0));
+  def totalin($u): (fresh($u) + ($u.cache_read_input_tokens // 0));
+  sort_by(.timestamp)
+  | group_by(.message_id)
+  | map(max_by(.timestamp))
+  | map(totalin(.usage))
+  | max // 0
+' "$tmp")"
+
+format_int() {
+  awk -v n="$1" 'BEGIN {
+    s = sprintf("%.0f", n)
+    neg = (substr(s,1,1) == "-")
+    if (neg) s = substr(s,2)
+    out = ""
+    while (length(s) > 3) {
+      out = "," substr(s,length(s)-2) out
+      s = substr(s,1,length(s)-3)
+    }
+    print (neg ? "-" : "") s out
+  }'
+}
+
 rate_low() { local v="$1" g="$2" o="$3" w="$4"; if (( v < g )); then echo '0|GREAT'; elif (( v < o )); then echo '1|GOOD'; elif (( v < w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
 rate_cache() { local v="$1" g="$2" o="$3" w="$4"; if (( v >= g )); then echo '0|GREAT'; elif (( v >= o )); then echo '1|GOOD'; elif (( v >= w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
 rate_turns() { local v="$1" g="$2" o="$3" w="$4"; if (( v <= g )); then echo '0|GREAT'; elif (( v <= o )); then echo '1|GOOD'; elif (( v <= w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
@@ -268,12 +319,62 @@ overall_name="BAD"
 if jq -n -e --argjson x "$weighted_score" '$x < 0.75' >/dev/null; then overall_name="GREAT"; elif jq -n -e --argjson x "$weighted_score" '$x < 1.50' >/dev/null; then overall_name="GOOD"; elif jq -n -e --argjson x "$weighted_score" '$x < 2.25' >/dev/null; then overall_name="WATCH"; fi
 if (( s2 == 3 && s3 == 3 )); then overall_name="BAD"; elif (( s1 == 3 && s2 >= 2 )) && [[ "$overall_name" == GREAT || "$overall_name" == GOOD ]]; then overall_name="WATCH"; fi
 
-rating_label() { case "$1" in GREAT) printf '🟢 GREAT';; GOOD) printf '🔵 GOOD';; WATCH) printf '🟡 WATCH';; BAD) printf '🔴 BAD';; esac; }
+rating_label() { case "$1" in GREAT) printf '🟢 GREAT';; GOOD) printf '🔵 GOOD';; WATCH) printf '🟡 WATCH';; BAD) printf '🔴 BAD';; N/A) printf '⚪ N/A';; esac; }
 l1="$(rating_label "$n1")"; l2="$(rating_label "$n2")"; l3="$(rating_label "$n3")"; l4="$(rating_label "$n4")"; l5="$(rating_label "$n5")"; overall_label="$(rating_label "$overall_name")"
 
+# Recommended efficiency health.
+health_cost_equiv=$(( uncached + cache_create + (cache_read + 5) / 10 + output * 5 ))
+health_cost_per_turn=$(( health_cost_equiv / (turns > 0 ? turns : 1) ))
+context_pressure=$(( max_turn_input * 100 / H_CONTEXT_WINDOW ))
+
+hc="$(rate_low "$health_cost_per_turn" "$H_COST_G" "$H_COST_O" "$H_COST_W")"
+hc_s="${hc%%|*}"; hc_n="${hc#*|}"; hc_l="$(rating_label "$hc_n")"
+
+cache_available=1
+if (( turns < H_CACHE_MIN_TURNS || input < H_CACHE_MIN_INPUT )); then
+  cache_available=0
+  hh_s=0; hh_n="N/A"; hh_l="$(rating_label N/A)"
+else
+  hh="$(rate_cache "$cache_ratio" "$H_CACHE_G" "$H_CACHE_O" "$H_CACHE_W")"
+  hh_s="${hh%%|*}"; hh_n="${hh#*|}"; hh_l="$(rating_label "$hh_n")"
+fi
+
+hp="$(rate_low "$context_pressure" 30 50 75)"
+hp_s="${hp%%|*}"; hp_n="${hp#*|}"; hp_l="$(rating_label "$hp_n")"
+
+hl="$(rate_turns "$turns" "$H_LOOP_G" "$H_LOOP_O" "$H_LOOP_W")"
+hl_s="${hl%%|*}"; hl_n="${hl#*|}"; hl_l="$(rating_label "$hl_n")"
+
+health_num=$(( hc_s * 35 + hp_s * 30 + hl_s * 10 ))
+health_den=75
+if (( cache_available )); then
+  health_num=$(( health_num + hh_s * 25 ))
+  health_den=100
+fi
+recommended_score="$(jq -nr --argjson n "$health_num" --argjson d "$health_den" '$n / $d')"
+recommended_name="BAD"
+if jq -n -e --argjson x "$recommended_score" '$x < 0.75' >/dev/null; then
+  recommended_name="GREAT"
+elif jq -n -e --argjson x "$recommended_score" '$x < 1.50' >/dev/null; then
+  recommended_name="GOOD"
+elif jq -n -e --argjson x "$recommended_score" '$x < 2.25' >/dev/null; then
+  recommended_name="WATCH"
+fi
+
+if (( context_pressure >= 90 )); then
+  recommended_name="BAD"
+elif (( cache_available && hh_s == 3 && hc_s >= 2 )); then
+  recommended_name="BAD"
+elif [[ "$recommended_name" == "BAD" && $hp_s -lt 3 && $hc_s -lt 3 ]]; then
+  recommended_name="WATCH"
+fi
+recommended_label="$(rating_label "$recommended_name")"
+
 health="$(jq -n --arg profile "$profile" --arg config_source "$config_source" --arg overall "$overall_name" --argjson weighted_score "$weighted_score" '{profile:$profile,config_source:$config_source,weighted_score:$weighted_score,overall:$overall}')"
+recommended_health="$(jq -n   --arg overall "$recommended_name"   --argjson score "$recommended_score"   --argjson cost_equivalent_tokens "$health_cost_equiv"   --argjson cost_equivalent_per_turn "$health_cost_per_turn"   --argjson context_pressure_percent "$context_pressure"   --argjson max_turn_input_tokens "$max_turn_input"   --argjson context_window_tokens "$H_CONTEXT_WINDOW"   --arg cache_status "$hh_n"   --arg cost_status "$hc_n"   --arg context_status "$hp_n"   --arg loop_status "$hl_n"   '{overall:$overall,score:$score,cost_equivalent_tokens:$cost_equivalent_tokens,cost_equivalent_per_turn:$cost_equivalent_per_turn,cache_status:$cache_status,context_pressure_percent:$context_pressure_percent,max_turn_input_tokens:$max_turn_input,context_window_tokens:$context_window_tokens,cost_status:$cost_status,context_status:$context_status,loop_status:$loop_status}')"
+
 if [[ "$output_mode" == "json" ]]; then
-  jq -n --argjson report "$report" --argjson health "$health" '$report + {health:$health}'
+  jq -n --argjson report "$report" --argjson health "$health" --argjson recommended "$recommended_health"     '$report + {health:$health,recommended_health:$recommended}'
   exit 0
 fi
 
@@ -286,21 +387,22 @@ echo "Model(s): ${models:--}"
 echo "Criteria profile: $profile"
 echo "Config: $config_source"
 echo
-printf "%-4s %-34s %12s   %s\n" "#" "METRIC" "VALUE" "RATING"
-printf "%-4s %-34s %12s   %s\n" "1" "effective_used_tokens" "$effective" "$l1"
-printf "%-4s %-34s %12s   %s\n" "2" "uncached_input_tokens" "$uncached" "$l2"
-printf "%-4s %-34s %11s%%   %s\n" "3" "cache_ratio_percent" "$cache_ratio" "$l3"
-printf "%-4s %-34s %12s   %s\n" "4" "input_tokens" "$input" "$l4"
-printf "%-4s %-34s %12s   %s\n" "5" "turns" "$turns" "$l5"
-printf "%-4s %-34s %12s   %s\n" "-" "cache_creation_input_tokens" "$cache_create" "INFO"
-printf "%-4s %-34s %12s   %s\n" "-" "cache_read_input_tokens" "$cache_read" "INFO"
-printf "%-4s %-34s %12s   %s\n" "-" "output_tokens" "$output" "INFO"
-printf "%-4s %-34s %12s   %s\n" "-" "main/subagent_turns" "$main_turns/$subagent_turns" "INFO"
+echo "Raw session metrics (legacy criteria)"
+printf "%-4s %-34s %14s   %s\n" "#" "METRIC" "VALUE" "RATING"
+printf "%-4s %-34s %14s   %s\n" "1" "effective_used_tokens" "$(format_int "$effective")" "$l1"
+printf "%-4s %-34s %14s   %s\n" "2" "uncached_input_tokens" "$(format_int "$uncached")" "$l2"
+printf "%-4s %-34s %13s%%   %s\n" "3" "cache_ratio_percent" "$cache_ratio" "$l3"
+printf "%-4s %-34s %14s   %s\n" "4" "input_tokens" "$(format_int "$input")" "$l4"
+printf "%-4s %-34s %14s   %s\n" "5" "turns" "$(format_int "$turns")" "$l5"
+printf "%-4s %-34s %14s   %s\n" "-" "cache_creation_input_tokens" "$(format_int "$cache_create")" "INFO"
+printf "%-4s %-34s %14s   %s\n" "-" "cache_read_input_tokens" "$(format_int "$cache_read")" "INFO"
+printf "%-4s %-34s %14s   %s\n" "-" "output_tokens" "$(format_int "$output")" "INFO"
+printf "%-4s %-34s %14s   %s\n" "-" "main/subagent_turns" "$(format_int "$main_turns")/$(format_int "$subagent_turns")" "INFO"
 echo
 echo "────────────────────────────────────────────────────────────"
-printf "OVERALL: %s  (weighted score: %.2f)\n" "$overall_label" "$weighted_score"
+printf "LEGACY OVERALL: %s  (weighted score: %.2f)\n" "$overall_label" "$weighted_score"
 echo
-echo "Criteria profile: $profile (Claude)"
+echo "Legacy criteria: $profile (Claude; session-size oriented)"
 printf "  %-3s %-12s %-14s %-14s %-14s %-14s %7s\n" "#" "METRIC" "GREAT" "GOOD" "WATCH" "BAD" "WEIGHT"
 printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "1" "Effective" "<$E_G" "$E_G-<$E_O" "$E_O-<$E_W" ">=$E_W" "$W_E"
 printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "2" "Uncached" "<$U_G" "$U_G-<$U_O" "$U_O-<$U_W" ">=$U_W" "$W_U"
@@ -308,6 +410,22 @@ printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "3" "Cache" ">=$C_G%" "$C_
 printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "4" "Input" "<$I_G" "$I_G-<$I_O" "$I_O-<$I_W" ">=$I_W" "$W_I"
 printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "5" "Turns" "<=$T_G" "$((T_G+1))-$T_O" "$((T_O+1))-$T_W" ">=$((T_W+1))" "$W_T"
 echo
-echo "Claude input = uncached input + cache creation + cache reads."
-echo "Claude does not expose a separate reasoning-output token field here; it is not scored."
-echo "Legend: 🟢 GREAT   🔵 GOOD   🟡 WATCH   🔴 BAD"
+echo "────────────────────────────────────────────────────────────"
+echo "Efficiency Health (recommended)"
+printf "%-22s %-42s %s\n" "DIMENSION" "VALUE" "STATUS"
+printf "%-22s %-42s %s\n" "Cost load" "$(format_int "$health_cost_equiv") eq total / $(format_int "$health_cost_per_turn") per turn" "$hc_l"
+if (( cache_available )); then
+  printf "%-22s %-42s %s\n" "Cache efficiency" "$cache_ratio% reuse" "$hh_l"
+else
+  printf "%-22s %-42s %s\n" "Cache efficiency" "N/A (<$H_CACHE_MIN_TURNS turns or <$(format_int "$H_CACHE_MIN_INPUT") input)" "$hh_l"
+fi
+printf "%-22s %-42s %s\n" "Context pressure" "$context_pressure% ($(format_int "$max_turn_input") / $(format_int "$H_CONTEXT_WINDOW"))" "$hp_l"
+printf "%-22s %-42s %s\n" "Loop behavior" "$(format_int "$turns") turns ($(format_int "$main_turns") main / $(format_int "$subagent_turns") subagent)" "$hl_l"
+echo
+printf "OVERALL HEALTH: %s  (score: %.2f)\n" "$recommended_label" "$recommended_score"
+echo "Cost-equivalent baseline: base input 1.0x + cache write 2.0x + cache read 0.10x + output 5.0x."
+echo "Cache-write TTL is not exposed in these transcripts; 2.0x is a conservative baseline."
+echo "Raw session size alone does not force BAD; strong context pressure or combined cache/cost waste does."
+echo "Claude has no separate reasoning-output token field here; reasoning is not invented or scored."
+echo
+echo "Legend: 🟢 GREAT   🔵 GOOD   🟡 WATCH   🔴 BAD   ⚪ N/A"
