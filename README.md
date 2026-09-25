@@ -97,6 +97,28 @@ If the requested rank is larger than the available turn count, the command exits
 
 The Codex `coding` profile keeps the existing token bands. Claude uses the same token bands but wider turn-count bands because one user request can produce several assistant/tool rounds.
 
+## Health scoring
+
+Each usage report has two layers:
+
+- **Raw metrics / legacy criteria** keep the existing fields, thresholds, and legacy rating for compatibility.
+- **Efficiency Health (recommended)** appears underneath and is the preferred health signal. It evaluates cost load per turn, cache reuse, peak single-turn context pressure, and loop behavior. Raw cumulative task/session size alone does not force a `BAD` result.
+
+Token counts use thousands separators for readability.
+
+Recommended cost-equivalent baselines are heuristics:
+
+```text
+Codex  = uncached input * 1.0 + cached input * 0.10 + output * 8.0
+Claude = base input * 1.0 + cache write * 2.0 + cache read * 0.10 + output * 5.0
+```
+
+Claude transcripts do not expose cache-write TTL, so `2.0x` is a conservative cache-write baseline. Claude also has no separate Codex-style reasoning-output field, so Token Lens does not invent one.
+
+Cache efficiency is `N/A` until the sample is useful (default: at least 3 turns and 20,000 input tokens). Context pressure uses the largest single-turn input rather than cumulative input. Default context-window baselines are 400,000 tokens for Codex and 200,000 for Claude; these are configurable heuristics, not automatic model detection.
+
+A recommended `BAD` is reserved for stronger pressure/waste evidence, such as very high context pressure or poor cache reuse combined with high cost load.
+
 ## Provider accounting
 
 ### Codex
