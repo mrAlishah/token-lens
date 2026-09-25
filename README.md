@@ -6,10 +6,7 @@
        width="50%" height="50%">
 </p>
 
-Token Lens is a CLI toolkit for inspecting Codex token usage at turn/task level.
-
-- `codex-turns` lists recent unique Codex turns with root/session IDs.
-- `codex-usage` reports task-level token health for a selected turn.
+Token Lens is a local CLI toolkit for inspecting token usage from **Codex** and **Claude Code** at turn/session level.
 
 > **Hint:** Ratings are heuristics, not exact or universal; model, repository, caching, tools/MCP/skills/plugins, and task complexity can change normal usage.
 > Compare similar workloads and your own history before treating a rating as inefficiency or a token leak.
@@ -18,9 +15,12 @@ Token Lens is a CLI toolkit for inspecting Codex token usage at turn/task level.
 
 - Bash
 - `jq` (`brew install jq`)
-- `ripgrep` / `rg` for `codex-usage` (`brew install ripgrep`)
+- `ripgrep` / `rg` for usage reports (`brew install ripgrep`)
 
-Codex session data is read from `~/.codex/sessions`. Override it with `CODEX_SESSIONS_DIR`.
+Local data sources:
+
+- Codex: `~/.codex/sessions` (override with `CODEX_SESSIONS_DIR`)
+- Claude Code: `~/.claude/projects` (override with `CLAUDE_PROJECTS_DIR`)
 
 ## Install
 
@@ -29,69 +29,85 @@ make install
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-This installs `codex-turns` and `codex-usage` into `~/.local/bin`.
+Installs `token-lens`, `codex-turns`, `codex-usage`, `claude-turns`, and `claude-usage` into `~/.local/bin`.
 
-## Usage
+## Multi-provider usage
+
+`token-lens` is the provider selector. The default provider is `all`.
+
+```bash
+# Recent turns, separated by provider
+token-lens turns
+token-lens turns --provider all 10
+token-lens turns --provider codex 10
+token-lens turns --provider claude 10
+
+# One provider
+token-lens usage --provider codex T-3aa6eba0
+token-lens usage --provider claude T-1234abcd
+token-lens usage --provider claude <session-id>
+
+# Both providers: latest turn from each
+token-lens usage --provider all --profile coding
+
+# Both providers: explicit provider-specific IDs
+token-lens usage --provider all \
+  --codex-id T-3aa6eba0 \
+  --claude-id T-1234abcd \
+  --profile agentic
+```
+
+With `--provider all`, text output is rendered in separate `CODEX` and `CLAUDE` sections. `--json` returns a provider-keyed object.
+
+The original provider-specific commands remain available:
 
 ```bash
 codex-turns
-codex-turns 20
-codex-turns --json
-
 codex-usage T-3aa6eba0
-codex-usage T-3aa6eba0 --profile agentic
-codex-usage T-3aa6eba0 --json
+
+claude-turns
+claude-usage T-1234abcd
 ```
 
-The default profile is `coding`; no config file or profile switch is required.
-
-### Profiles
+## Profiles
 
 - `simple`: focused edits/questions with limited tool use.
 - `coding`: default software-engineering work with repository reads, tools, MCP/plugin/skill activity, tests, and several turns.
-- `agentic`: longer autonomous workflows with more exploration, validation, and iteration.
+- `agentic`: longer autonomous workflows with more exploration, validation, subagents, and iteration.
 
-## Default coding criteria
+The Codex `coding` profile keeps the existing token bands. Claude uses the same token bands but wider turn-count bands because one user request can produce several assistant/tool rounds.
 
-| Metric | GREAT | GOOD | WATCH | BAD | Weight |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Effective | < 8K | 8K-<20K | 20K-<50K | >= 50K | 30% |
-| Uncached | < 6K | 6K-<15K | 15K-<35K | >= 35K | 25% |
-| Cache | >= 80% | 60-<80% | 35-<60% | < 35% | 20% |
-| Input | < 50K | 50K-<150K | 150K-<300K | >= 300K | 10% |
-| Reasoning | < 1K | 1K-<4K | 4K-<12K | >= 12K | 10% |
-| Turns | <= 3 | 4-8 | 9-15 | >= 16 | 5% |
+## Provider accounting
 
-The defaults are hardcoded in `bin/codex-usage`. Effective, uncached input, and cache ratio intentionally have more influence than raw input or turn count. High input can still be healthy when most context is cached, and multiple turns are normal in tool-driven coding.
+### Codex
 
-The overall rating is weighted rather than equal to the single worst metric. A strong waste signal such as BAD uncached input together with a BAD cache ratio still forces an overall BAD result.
+Codex reports task-level totals derived from its `token_usage_record` records, including input, cached input, output, reasoning output, and root-turn relationships.
+
+### Claude Code
+
+Claude Code usage is read from assistant transcript records and deduplicated by `message.id` so repeated/streamed records are not counted twice.
+
+Token Lens interprets Claude fields as:
+
+```text
+uncached_input = input_tokens + cache_creation_input_tokens
+total_input    = uncached_input + cache_read_input_tokens
+effective      = uncached_input + output_tokens
+cache_ratio    = cache_read_input_tokens / total_input
+```
+
+Main-session and subagent records are reported separately and included in session totals when they share the selected `sessionId`.
+
+Claude transcript usage does not expose a Codex-equivalent `reasoning_output_tokens` field, so that metric is not invented or scored for Claude.
 
 ## Optional config
 
-Token Lens automatically reads `~/.config/token-lens/config.json` when present. Missing values keep the built-in defaults.
+Token Lens automatically reads `~/.config/token-lens/config.json` when present. Missing values keep the hardcoded defaults.
 
-See `config/example_config.json` for the full shape.
-
-```json
-{
-  "default_profile": "coding",
-  "profiles": {
-    "coding": {
-      "criteria": {
-        "effective_used_tokens": {
-          "great_lt": 10000,
-          "good_lt": 25000,
-          "watch_lt": 60000
-        }
-      }
-    }
-  }
-}
-```
-
-Use another file or ignore config for one run:
+See `config/example_config.json`. Provider-specific Claude overrides can live under `providers.claude.profiles`; otherwise Claude falls back to the common profile values.
 
 ```bash
 codex-usage T-3aa6eba0 --config /path/to/config.json
-codex-usage T-3aa6eba0 --no-config
+claude-usage T-1234abcd --config /path/to/config.json
+token-lens usage --provider all --no-config
 ```

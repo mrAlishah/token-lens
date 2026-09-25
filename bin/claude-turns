@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -u
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  claude-turns [limit]
+  claude-turns --limit <n>
+  claude-turns [limit] --json
+
+Lists recent unique Claude Code assistant turns from ~/.claude/projects.
+USAGE
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required."
+[[ -d "$PROJECTS_DIR" ]] || die "Claude projects directory not found: $PROJECTS_DIR"
+
+limit=10
+output_mode="table"
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --json) output_mode="json"; shift ;;
+    -n|--limit)
+      (( $# >= 2 )) || die "$1 requires a value."
+      limit="$2"; shift 2 ;;
+    *[!0-9]*|'') die "Unknown argument: $1" ;;
+    *) limit="$1"; shift ;;
+  esac
+done
+[[ "$limit" =~ ^[1-9][0-9]*$ ]] || die "Limit must be a positive integer."
+
+tmp="$(mktemp -t claude-turns.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+while IFS= read -r -d '' file; do
+  jq -rc --arg file "$file" '
+    select(.type == "assistant")
+    | select(.message.usage? != null)
+    | select((.uuid // "") | type == "string" and length > 0)
+    | {
+        timestamp: (.timestamp // ""),
+        uuid: .uuid,
+        message_id: (.message.id // .uuid),
+        parent_uuid: (.parentUuid // ""),
+        session_id: (.sessionId // ""),
+        model: (.message.model // ""),
+        source: (if ($file | contains("/subagents/")) then "subagent" else "main" end)
+      }
+  ' "$file" 2>/dev/null
+done < <(find "$PROJECTS_DIR" -type f -name '*.jsonl' -print0) \
+  | jq -sc '
+      sort_by(.timestamp)
+      | group_by(.message_id)
+      | map(max_by(.timestamp))
+      | sort_by(.timestamp) | reverse
+    ' \
+  | jq -r --argjson limit "$limit" '.[:$limit][] | [
+      .timestamp,
+      ("T-" + .uuid[-8:]),
+      .session_id,
+      .uuid,
+      .model,
+      .source
+    ] | @tsv' > "$tmp"
+
+if [[ "$output_mode" == "json" ]]; then
+  jq -Rn '[inputs | split("\t") | {
+    timestamp: .[0], short_id: .[1], session_id: .[2],
+    turn_id: .[3], model: .[4], source: .[5]
+  }]' < "$tmp"
+  exit 0
+fi
+
+printf "%-22s %-11s %-38s %-38s %-24s %-9s\n" \
+  "TIME" "SHORT-ID" "SESSION-ID" "TURN-ID" "MODEL" "SOURCE"
+while IFS=$'\t' read -r ts short session turn model source; do
+  [[ -n "$turn" ]] || continue
+  printf "%-22s %-11s %-38s %-38s %-24s %-9s\n" \
+    "$ts" "$short" "${session:--}" "$turn" "${model:--}" "${source:--}"
+done < "$tmp"

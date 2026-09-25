@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -u
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  claude-usage <turn-id|session-id> [--profile simple|coding|agentic] [--config <path>] [--no-config] [--json]
+
+Defaults:
+  profile: coding
+  config:  ~/.config/token-lens/config.json (optional)
+USAGE
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || die "jq is required."
+command -v rg >/dev/null 2>&1 || die "ripgrep (rg) is required."
+[[ -d "$PROJECTS_DIR" ]] || die "Claude projects directory not found: $PROJECTS_DIR"
+
+load_profile() {
+  case "$1" in
+    simple)
+      E_G=3000; E_O=8000; E_W=20000
+      U_G=2000; U_O=6000; U_W=15000
+      C_G=85; C_O=70; C_W=50
+      I_G=25000; I_O=60000; I_W=120000
+      T_G=4; T_O=8; T_W=16
+      ;;
+    coding)
+      E_G=8000; E_O=20000; E_W=50000
+      U_G=6000; U_O=15000; U_W=35000
+      C_G=80; C_O=60; C_W=35
+      I_G=50000; I_O=150000; I_W=300000
+      T_G=6; T_O=16; T_W=30
+      ;;
+    agentic)
+      E_G=15000; E_O=40000; E_W=100000
+      U_G=10000; U_O=30000; U_W=75000
+      C_G=75; C_O=50; C_W=25
+      I_G=100000; I_O=300000; I_W=700000
+      T_G=10; T_O=30; T_W=60
+      ;;
+    *) die "Unknown criteria profile: $1" ;;
+  esac
+  W_E=30; W_U=25; W_C=20; W_I=10; W_T=5
+}
+
+requested=""
+profile="coding"
+profile_explicit=0
+output_mode="table"
+config_mode="auto"
+config_path="$HOME/.config/token-lens/config.json"
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --json) output_mode="json"; shift ;;
+    --profile)
+      (( $# >= 2 )) || die "--profile requires a value."
+      profile="$2"; profile_explicit=1; shift 2 ;;
+    --config)
+      (( $# >= 2 )) || die "--config requires a path."
+      config_path="$2"; config_mode="required"; shift 2 ;;
+    --no-config) config_mode="disabled"; shift ;;
+    --*) die "Unknown option: $1" ;;
+    *)
+      [[ -z "$requested" ]] || die "Only one turn/session ID may be provided."
+      requested="$1"; shift ;;
+  esac
+done
+[[ -n "$requested" ]] || { usage; exit 1; }
+
+config_source="built-in defaults"
+if [[ "$config_mode" != "disabled" ]]; then
+  if [[ -f "$config_path" ]]; then
+    jq -e . "$config_path" >/dev/null 2>&1 || die "Invalid JSON config: $config_path"
+    if (( profile_explicit == 0 )); then
+      configured_profile="$(jq -r '.default_profile // empty' "$config_path")"
+      [[ -z "$configured_profile" ]] || profile="$configured_profile"
+    fi
+    config_source="$config_path"
+  elif [[ "$config_mode" == "required" ]]; then
+    die "Config file not found: $config_path"
+  fi
+fi
+load_profile "$profile"
+
+config_value() {
+  local path="$1"
+  [[ "$config_source" != "built-in defaults" ]] || return 0
+  jq -r --arg p "$profile" --arg path "$path" '
+    ($path | split(".")) as $tail
+    | (getpath(["providers", "claude", "profiles", $p] + $tail)
+       // getpath(["profiles", $p] + $tail)
+       // empty)
+  ' "$config_path"
+}
+apply_override() {
+  local variable="$1" path="$2" value
+  value="$(config_value "$path")"
+  [[ -z "$value" ]] || printf -v "$variable" '%s' "$value"
+}
+
+apply_override E_G criteria.effective_used_tokens.great_lt
+apply_override E_O criteria.effective_used_tokens.good_lt
+apply_override E_W criteria.effective_used_tokens.watch_lt
+apply_override U_G criteria.uncached_input_tokens.great_lt
+apply_override U_O criteria.uncached_input_tokens.good_lt
+apply_override U_W criteria.uncached_input_tokens.watch_lt
+apply_override C_G criteria.cache_ratio_percent.great_gte
+apply_override C_O criteria.cache_ratio_percent.good_gte
+apply_override C_W criteria.cache_ratio_percent.watch_gte
+apply_override I_G criteria.input_tokens.great_lt
+apply_override I_O criteria.input_tokens.good_lt
+apply_override I_W criteria.input_tokens.watch_lt
+apply_override T_G criteria.turns.great_lte
+apply_override T_O criteria.turns.good_lte
+apply_override T_W criteria.turns.watch_lte
+apply_override W_E weights.effective_used_tokens
+apply_override W_U weights.uncached_input_tokens
+apply_override W_C weights.cache_ratio_percent
+apply_override W_I weights.input_tokens
+apply_override W_T weights.turns
+
+for value in "$E_G" "$E_O" "$E_W" "$U_G" "$U_O" "$U_W" "$C_G" "$C_O" "$C_W" "$I_G" "$I_O" "$I_W" "$T_G" "$T_O" "$T_W" "$W_E" "$W_U" "$W_C" "$W_I" "$W_T"; do
+  [[ "$value" =~ ^[0-9]+$ ]] || die "Criteria and weights must be non-negative integers."
+done
+(( E_G < E_O && E_O < E_W )) || die "Invalid Effective thresholds for profile: $profile"
+(( U_G < U_O && U_O < U_W )) || die "Invalid Uncached thresholds for profile: $profile"
+(( C_G > C_O && C_O > C_W )) || die "Invalid Cache thresholds for profile: $profile"
+(( I_G < I_O && I_O < I_W )) || die "Invalid Input thresholds for profile: $profile"
+(( T_G < T_O && T_O < T_W )) || die "Invalid Turns thresholds for profile: $profile"
+(( W_E > 0 && W_U > 0 && W_C > 0 && W_I > 0 && W_T > 0 )) || die "All metric weights must be positive."
+
+needle="$requested"
+[[ "$needle" == T-* ]] && needle="${needle#T-}"
+resolved="$(
+  while IFS= read -r -d '' file; do
+    jq -rc --arg needle "$needle" '
+      select(.type == "assistant" and .message.usage? != null)
+      | select(
+          ((.uuid // "") == $needle)
+          or ((.uuid // "") | endswith($needle))
+          or ((.sessionId // "") == $needle)
+          or ((.sessionId // "") | endswith($needle))
+        )
+      | [(.timestamp // ""), (.uuid // ""), (.sessionId // ""), (.message.id // .uuid // "")]
+      | @tsv
+    ' "$file" 2>/dev/null
+  done < <(find "$PROJECTS_DIR" -type f -name '*.jsonl' -print0)
+)"
+[[ -n "$resolved" ]] || die "Claude turn/session ID not found: $requested"
+
+candidates="$(printf '%s\n' "$resolved" | sort -u -t $'\t' -k2,3)"
+exact="$(printf '%s\n' "$candidates" | awk -F '\t' -v needle="$needle" '$2 == needle || $3 == needle')"
+if [[ -n "$exact" ]]; then
+  selected_line="$(printf '%s\n' "$exact" | sort -r | head -1)"
+else
+  identities="$(printf '%s\n' "$candidates" | awk -F '\t' '{print $2 "\t" $3}' | sort -u)"
+  count="$(printf '%s\n' "$identities" | sed '/^$/d' | wc -l | tr -d ' ')"
+  (( count == 1 )) || { echo "Error: Claude short ID is ambiguous: $requested" >&2; printf '%s\n' "$identities" >&2; exit 1; }
+  selected_line="$(printf '%s\n' "$candidates" | sort -r | head -1)"
+fi
+IFS=$'\t' read -r selected_ts selected_uuid session_id selected_message_id <<< "$selected_line"
+[[ -n "$session_id" ]] || die "Selected Claude record has no sessionId."
+short="T-${selected_uuid: -8}"
+
+tmp="$(mktemp -t claude-usage.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT INT TERM
+while IFS= read -r -d '' file; do
+  jq -c --arg session "$session_id" --arg file "$file" '
+    select(.type == "assistant" and .sessionId == $session and .message.usage? != null)
+    | {
+        timestamp: (.timestamp // ""),
+        uuid: (.uuid // ""),
+        session_id: .sessionId,
+        message_id: (.message.id // .uuid // ""),
+        model: (.message.model // ""),
+        source: (if ($file | contains("/subagents/")) then "subagent" else "main" end),
+        usage: .message.usage
+      }
+  ' "$file" 2>/dev/null
+done < <(find "$PROJECTS_DIR" -type f -name '*.jsonl' -print0) > "$tmp"
+[[ -s "$tmp" ]] || die "No Claude usage records found for session: $session_id"
+
+report="$(jq -s --arg uuid "$selected_uuid" --arg session "$session_id" --arg short "$short" '
+  def fresh($u): (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0));
+  def totalin($u): (fresh($u) + ($u.cache_read_input_tokens // 0));
+  sort_by(.timestamp)
+  | group_by(.message_id)
+  | map(max_by(.timestamp))
+  | . as $records
+  | ($records | map(select(.uuid == $uuid)) | last) as $selected
+  | {
+      provider: "claude",
+      id: {
+        short_id: $short,
+        turn_id: $uuid,
+        session_id: $session,
+        model: ($selected.model // null),
+        source: ($selected.source // null)
+      },
+      selected_turn: (
+        if $selected == null then null else
+          ($selected.usage // {}) as $u
+          | $u + {
+              total_input_tokens: totalin($u),
+              uncached_input_tokens: fresh($u),
+              effective_used_tokens: (fresh($u) + ($u.output_tokens // 0)),
+              cache_ratio_percent: (if totalin($u) > 0 then (((($u.cache_read_input_tokens // 0) / totalin($u)) * 100) | round) else 0 end)
+            }
+        end
+      ),
+      whole_session: {
+        turns: ($records | length),
+        main_turns: ($records | map(select(.source == "main")) | length),
+        subagent_turns: ($records | map(select(.source == "subagent")) | length),
+        models: ($records | map(.model) | map(select(length > 0)) | unique),
+        input_tokens: ($records | map(totalin(.usage)) | add // 0),
+        cache_creation_input_tokens: ($records | map(.usage.cache_creation_input_tokens // 0) | add // 0),
+        cache_read_input_tokens: ($records | map(.usage.cache_read_input_tokens // 0) | add // 0),
+        uncached_input_tokens: ($records | map(fresh(.usage)) | add // 0),
+        output_tokens: ($records | map(.usage.output_tokens // 0) | add // 0),
+        effective_used_tokens: ($records | map(fresh(.usage) + (.usage.output_tokens // 0)) | add // 0)
+      }
+    }
+' "$tmp")" || die "Failed to build Claude usage report."
+
+input="$(jq -r '.whole_session.input_tokens' <<<"$report")"
+uncached="$(jq -r '.whole_session.uncached_input_tokens' <<<"$report")"
+effective="$(jq -r '.whole_session.effective_used_tokens' <<<"$report")"
+cache_read="$(jq -r '.whole_session.cache_read_input_tokens' <<<"$report")"
+cache_create="$(jq -r '.whole_session.cache_creation_input_tokens' <<<"$report")"
+output="$(jq -r '.whole_session.output_tokens' <<<"$report")"
+turns="$(jq -r '.whole_session.turns' <<<"$report")"
+main_turns="$(jq -r '.whole_session.main_turns' <<<"$report")"
+subagent_turns="$(jq -r '.whole_session.subagent_turns' <<<"$report")"
+models="$(jq -r '.whole_session.models | join(", ")' <<<"$report")"
+cache_ratio=0
+(( input > 0 )) && cache_ratio=$(( cache_read * 100 / input ))
+
+rate_low() { local v="$1" g="$2" o="$3" w="$4"; if (( v < g )); then echo '0|GREAT'; elif (( v < o )); then echo '1|GOOD'; elif (( v < w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
+rate_cache() { local v="$1" g="$2" o="$3" w="$4"; if (( v >= g )); then echo '0|GREAT'; elif (( v >= o )); then echo '1|GOOD'; elif (( v >= w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
+rate_turns() { local v="$1" g="$2" o="$3" w="$4"; if (( v <= g )); then echo '0|GREAT'; elif (( v <= o )); then echo '1|GOOD'; elif (( v <= w )); then echo '2|WATCH'; else echo '3|BAD'; fi; }
+
+r1="$(rate_low "$effective" "$E_G" "$E_O" "$E_W")"
+r2="$(rate_low "$uncached" "$U_G" "$U_O" "$U_W")"
+r3="$(rate_cache "$cache_ratio" "$C_G" "$C_O" "$C_W")"
+r4="$(rate_low "$input" "$I_G" "$I_O" "$I_W")"
+r5="$(rate_turns "$turns" "$T_G" "$T_O" "$T_W")"
+s1="${r1%%|*}"; n1="${r1#*|}"; s2="${r2%%|*}"; n2="${r2#*|}"; s3="${r3%%|*}"; n3="${r3#*|}"; s4="${r4%%|*}"; n4="${r4#*|}"; s5="${r5%%|*}"; n5="${r5#*|}"
+
+weighted_score="$(jq -nr --argjson s1 "$s1" --argjson w1 "$W_E" --argjson s2 "$s2" --argjson w2 "$W_U" --argjson s3 "$s3" --argjson w3 "$W_C" --argjson s4 "$s4" --argjson w4 "$W_I" --argjson s5 "$s5" --argjson w5 "$W_T" '(($s1*$w1)+($s2*$w2)+($s3*$w3)+($s4*$w4)+($s5*$w5))/($w1+$w2+$w3+$w4+$w5)')"
+overall_name="BAD"
+if jq -n -e --argjson x "$weighted_score" '$x < 0.75' >/dev/null; then overall_name="GREAT"; elif jq -n -e --argjson x "$weighted_score" '$x < 1.50' >/dev/null; then overall_name="GOOD"; elif jq -n -e --argjson x "$weighted_score" '$x < 2.25' >/dev/null; then overall_name="WATCH"; fi
+if (( s2 == 3 && s3 == 3 )); then overall_name="BAD"; elif (( s1 == 3 && s2 >= 2 )) && [[ "$overall_name" == GREAT || "$overall_name" == GOOD ]]; then overall_name="WATCH"; fi
+
+rating_label() { case "$1" in GREAT) printf '🟢 GREAT';; GOOD) printf '🔵 GOOD';; WATCH) printf '🟡 WATCH';; BAD) printf '🔴 BAD';; esac; }
+l1="$(rating_label "$n1")"; l2="$(rating_label "$n2")"; l3="$(rating_label "$n3")"; l4="$(rating_label "$n4")"; l5="$(rating_label "$n5")"; overall_label="$(rating_label "$overall_name")"
+
+health="$(jq -n --arg profile "$profile" --arg config_source "$config_source" --arg overall "$overall_name" --argjson weighted_score "$weighted_score" '{profile:$profile,config_source:$config_source,weighted_score:$weighted_score,overall:$overall}')"
+if [[ "$output_mode" == "json" ]]; then
+  jq -n --argjson report "$report" --argjson health "$health" '$report + {health:$health}'
+  exit 0
+fi
+
+echo
+echo "Claude Token Health"
+echo "────────────────────────────────────────────────────────────"
+echo "Turn: $short"
+echo "Session: $session_id"
+echo "Model(s): ${models:--}"
+echo "Criteria profile: $profile"
+echo "Config: $config_source"
+echo
+printf "%-4s %-34s %12s   %s\n" "#" "METRIC" "VALUE" "RATING"
+printf "%-4s %-34s %12s   %s\n" "1" "effective_used_tokens" "$effective" "$l1"
+printf "%-4s %-34s %12s   %s\n" "2" "uncached_input_tokens" "$uncached" "$l2"
+printf "%-4s %-34s %11s%%   %s\n" "3" "cache_ratio_percent" "$cache_ratio" "$l3"
+printf "%-4s %-34s %12s   %s\n" "4" "input_tokens" "$input" "$l4"
+printf "%-4s %-34s %12s   %s\n" "5" "turns" "$turns" "$l5"
+printf "%-4s %-34s %12s   %s\n" "-" "cache_creation_input_tokens" "$cache_create" "INFO"
+printf "%-4s %-34s %12s   %s\n" "-" "cache_read_input_tokens" "$cache_read" "INFO"
+printf "%-4s %-34s %12s   %s\n" "-" "output_tokens" "$output" "INFO"
+printf "%-4s %-34s %12s   %s\n" "-" "main/subagent_turns" "$main_turns/$subagent_turns" "INFO"
+echo
+echo "────────────────────────────────────────────────────────────"
+printf "OVERALL: %s  (weighted score: %.2f)\n" "$overall_label" "$weighted_score"
+echo
+echo "Criteria profile: $profile (Claude)"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %7s\n" "#" "METRIC" "GREAT" "GOOD" "WATCH" "BAD" "WEIGHT"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "1" "Effective" "<$E_G" "$E_G-<$E_O" "$E_O-<$E_W" ">=$E_W" "$W_E"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "2" "Uncached" "<$U_G" "$U_G-<$U_O" "$U_O-<$U_W" ">=$U_W" "$W_U"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "3" "Cache" ">=$C_G%" "$C_O-<$C_G%" "$C_W-<$C_O%" "<$C_W%" "$W_C"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "4" "Input" "<$I_G" "$I_G-<$I_O" "$I_O-<$I_W" ">=$I_W" "$W_I"
+printf "  %-3s %-12s %-14s %-14s %-14s %-14s %6s%%\n" "5" "Turns" "<=$T_G" "$((T_G+1))-$T_O" "$((T_O+1))-$T_W" ">=$((T_W+1))" "$W_T"
+echo
+echo "Claude input = uncached input + cache creation + cache reads."
+echo "Claude does not expose a separate reasoning-output token field here; it is not scored."
+echo "Legend: 🟢 GREAT   🔵 GOOD   🟡 WATCH   🔴 BAD"

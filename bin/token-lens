@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -u
+
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  token-lens turns [--provider codex|claude|all] [limit|--limit N] [--json]
+  token-lens usage [--provider codex|claude] <id> [usage options]
+  token-lens usage --provider all [--codex-id <id>] [--claude-id <id>] [usage options]
+
+Provider defaults to all.
+For `usage --provider all`, omitted IDs resolve to each provider's latest turn.
+USAGE
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+run_section() {
+  local title="$1"; shift
+  echo
+  echo "===== $title ====="
+  "$@"
+}
+latest_id() {
+  local provider="$1"
+  "$BIN_DIR/$provider-turns" 1 --json 2>/dev/null | jq -r '.[0].short_id // empty'
+}
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
+command="$1"; shift
+case "$command" in
+  turns|usage) ;;
+  -h|--help) usage; exit 0 ;;
+  *) die "Unknown command: $command" ;;
+esac
+
+provider="all"
+codex_id=""
+claude_id=""
+args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --provider)
+      (( $# >= 2 )) || die "--provider requires a value."
+      provider="$2"; shift 2 ;;
+    --codex-id)
+      (( $# >= 2 )) || die "--codex-id requires a value."
+      codex_id="$2"; shift 2 ;;
+    --claude-id)
+      (( $# >= 2 )) || die "--claude-id requires a value."
+      claude_id="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+case "$provider" in codex|claude|all) ;; *) die "Unknown provider: $provider" ;; esac
+
+if [[ "$command" == "turns" ]]; then
+  if [[ "$provider" == "codex" || "$provider" == "claude" ]]; then
+    exec "$BIN_DIR/$provider-turns" "${args[@]}"
+  fi
+
+  # Keep provider output separate. JSON returns a provider-keyed object.
+  json_mode=0
+  for arg in "${args[@]}"; do [[ "$arg" == "--json" ]] && json_mode=1; done
+  if (( json_mode )); then
+    codex_json='[]'; claude_json='[]'
+    codex_json="$("$BIN_DIR/codex-turns" "${args[@]}" 2>/dev/null || printf '[]')"
+    claude_json="$("$BIN_DIR/claude-turns" "${args[@]}" 2>/dev/null || printf '[]')"
+    jq -n --argjson codex "$codex_json" --argjson claude "$claude_json" '{codex:$codex,claude:$claude}'
+  else
+    run_section "CODEX" "$BIN_DIR/codex-turns" "${args[@]}" || echo "Codex data unavailable."
+    run_section "CLAUDE" "$BIN_DIR/claude-turns" "${args[@]}" || echo "Claude data unavailable."
+  fi
+  exit 0
+fi
+
+# usage
+if [[ "$provider" == "codex" || "$provider" == "claude" ]]; then
+  exec "$BIN_DIR/$provider-usage" "${args[@]}"
+fi
+
+# all: IDs are provider-specific. Use explicit IDs when supplied, otherwise latest.
+if [[ ${#args[@]} -gt 0 && "${args[0]}" != --* ]]; then
+  die "usage --provider all does not accept one shared ID; use --codex-id/--claude-id or omit IDs for latest."
+fi
+[[ -n "$codex_id" ]] || codex_id="$(latest_id codex || true)"
+[[ -n "$claude_id" ]] || claude_id="$(latest_id claude || true)"
+
+json_mode=0
+for arg in "${args[@]}"; do [[ "$arg" == "--json" ]] && json_mode=1; done
+if (( json_mode )); then
+  codex_json='null'; claude_json='null'
+  [[ -z "$codex_id" ]] || codex_json="$("$BIN_DIR/codex-usage" "$codex_id" "${args[@]}" 2>/dev/null || printf 'null')"
+  [[ -z "$claude_id" ]] || claude_json="$("$BIN_DIR/claude-usage" "$claude_id" "${args[@]}" 2>/dev/null || printf 'null')"
+  jq -n --argjson codex "$codex_json" --argjson claude "$claude_json" '{codex:$codex,claude:$claude}'
+else
+  if [[ -n "$codex_id" ]]; then
+    run_section "CODEX" "$BIN_DIR/codex-usage" "$codex_id" "${args[@]}" || echo "Codex usage unavailable."
+  else
+    echo; echo "===== CODEX ====="; echo "Codex data unavailable."
+  fi
+  if [[ -n "$claude_id" ]]; then
+    run_section "CLAUDE" "$BIN_DIR/claude-usage" "$claude_id" "${args[@]}" || echo "Claude usage unavailable."
+  else
+    echo; echo "===== CLAUDE ====="; echo "Claude data unavailable."
+  fi
+fi
