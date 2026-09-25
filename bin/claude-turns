@@ -21,6 +21,7 @@ command -v jq >/dev/null 2>&1 || die "jq is required."
 
 limit=10
 output_mode="table"
+
 while (( $# > 0 )); do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -32,54 +33,70 @@ while (( $# > 0 )); do
     *) limit="$1"; shift ;;
   esac
 done
+
 [[ "$limit" =~ ^[1-9][0-9]*$ ]] || die "Limit must be a positive integer."
 
 tmp="$(mktemp -t claude-turns.XXXXXX)"
 trap 'rm -f "$tmp"' EXIT INT TERM
 
 while IFS= read -r -d '' file; do
-  jq -rc --arg file "$file" '
-    select(.type == "assistant")
+  jq -rcs --arg file "$file" '
+    ([.[]
+      | (.cwd // .projectPath // empty)
+      | select(type == "string" and length > 0)
+    ] | first // "") as $file_source
+    | .[]
+    | select(.type == "assistant")
     | select(.message.usage? != null)
     | select((.uuid // "") | type == "string" and length > 0)
     | {
         timestamp: (.timestamp // ""),
-        uuid: .uuid,
+        turn_id: .uuid,
         message_id: (.message.id // .uuid),
-        parent_uuid: (.parentUuid // ""),
         session_id: (.sessionId // ""),
         model: (.message.model // ""),
-        source: (if ($file | contains("/subagents/")) then "subagent" else "main" end)
+        source: (.cwd // .projectPath // $file_source // "")
       }
   ' "$file" 2>/dev/null
 done < <(find "$PROJECTS_DIR" -type f -name '*.jsonl' -print0) \
-  | jq -sc '
+  | jq -sc --argjson limit "$limit" '
       sort_by(.timestamp)
       | group_by(.message_id)
       | map(max_by(.timestamp))
       | sort_by(.timestamp) | reverse
-    ' \
-  | jq -r --argjson limit "$limit" '.[:$limit][] | [
-      .timestamp,
-      ("T-" + .uuid[-8:]),
-      .session_id,
-      .uuid,
-      .model,
-      .source
-    ] | @tsv' > "$tmp"
+      | .[:$limit]
+      | map(. + {
+          short_id: ("T-" + .turn_id[-8:]),
+          root_turn_id: null,
+          short_root_id:
+            (
+              if (.session_id | length) > 0 then
+                ("S-" + .session_id[-8:])
+              else
+                "-"
+              end
+            )
+        })
+    ' > "$tmp"
 
 if [[ "$output_mode" == "json" ]]; then
-  jq -Rn '[inputs | split("\t") | {
-    timestamp: .[0], short_id: .[1], session_id: .[2],
-    turn_id: .[3], model: .[4], source: .[5]
-  }]' < "$tmp"
+  cat "$tmp"
   exit 0
 fi
 
-printf "%-22s %-11s %-38s %-38s %-24s %-9s\n" \
-  "TIME" "SHORT-ID" "SESSION-ID" "TURN-ID" "MODEL" "SOURCE"
-while IFS=$'\t' read -r ts short session turn model source; do
-  [[ -n "$turn" ]] || continue
-  printf "%-22s %-11s %-38s %-38s %-24s %-9s\n" \
-    "$ts" "$short" "${session:--}" "$turn" "${model:--}" "${source:--}"
-done < "$tmp"
+printf "%-22s %-11s %-11s %-38s %-38s %-24s %s\n" \
+  "TIME" "SHORT-ID" "ROOT-ID" "SESSION-ID" "TURN-ID" "MODEL" "SOURCE"
+
+jq -r '.[] | [
+  .timestamp,
+  .short_id,
+  .short_root_id,
+  (.session_id // ""),
+  .turn_id,
+  (.model // ""),
+  (.source // "")
+] | @tsv' "$tmp" |
+while IFS=$'\t' read -r ts short root session turn model source; do
+  printf "%-22s %-11s %-11s %-38s %-38s %-24s %s\n" \
+    "$ts" "$short" "$root" "${session:--}" "$turn" "${model:--}" "${source:--}"
+done

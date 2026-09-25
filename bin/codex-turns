@@ -14,10 +14,7 @@ Lists the most recent unique Codex turns from ~/.codex/sessions.
 USAGE
 }
 
-die() {
-  echo "Error: $*" >&2
-  exit 1
-}
+die() { echo "Error: $*" >&2; exit 1; }
 
 command -v jq >/dev/null 2>&1 || die "jq is required."
 [[ -d "$SESSIONS_DIR" ]] || die "Codex sessions directory not found: $SESSIONS_DIR"
@@ -27,26 +24,13 @@ output_mode="table"
 
 while (( $# > 0 )); do
   case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --json)
-      output_mode="json"
-      shift
-      ;;
+    -h|--help) usage; exit 0 ;;
+    --json) output_mode="json"; shift ;;
     -n|--limit)
       (( $# >= 2 )) || die "$1 requires a value."
-      limit="$2"
-      shift 2
-      ;;
-    *[!0-9]*|'')
-      die "Unknown argument: $1"
-      ;;
-    *)
-      limit="$1"
-      shift
-      ;;
+      limit="$2"; shift 2 ;;
+    *[!0-9]*|'') die "Unknown argument: $1" ;;
+    *) limit="$1"; shift ;;
   esac
 done
 
@@ -56,46 +40,69 @@ tmp="$(mktemp -t codex-turns.XXXXXX)"
 trap 'rm -f "$tmp"' EXIT INT TERM
 
 while IFS= read -r -d '' file; do
-  jq -r '
-    select(.type == "token_usage_record")
+  jq -rcs --arg file "$file" '
+    ([.[]
+      | select(.type == "session_meta")
+      | (.payload.cwd // .payload.project_path // .cwd // empty)
+      | select(type == "string" and length > 0)
+    ] | first // "") as $session_source
+    | ([.[]
+      | select(.type == "session_meta")
+      | (.payload.model // .payload.model_name // empty)
+      | select(type == "string" and length > 0)
+    ] | first // "") as $session_model
+    | .[]
+    | select(.type == "token_usage_record")
     | select(.payload.turn_id | type == "string")
-    | [
-        (.timestamp // ""),
-        ("T-" + .payload.turn_id[-8:]),
-        .payload.turn_id,
-        (.payload.root_turn_id // .payload.turn_id),
-        ("T-" + ((.payload.root_turn_id // .payload.turn_id)[-8:])),
-        (.payload.session_id // "")
-      ]
-    | @tsv
+    | {
+        timestamp: (.timestamp // ""),
+        turn_id: .payload.turn_id,
+        root_turn_id: (.payload.root_turn_id // .payload.turn_id),
+        session_id: (.payload.session_id // ""),
+        model: (.payload.model // $session_model // ""),
+        source: (.payload.cwd // .payload.project_path // $session_source // "")
+      }
   ' "$file" 2>/dev/null
 done < <(find "$SESSIONS_DIR" -type f -name '*.jsonl' -print0) \
-  | sort -r \
-  | awk -F '\t' '!seen[$3]++' \
-  | head -"$limit" > "$tmp"
+  | jq -sc --argjson limit "$limit" '
+      sort_by(.timestamp)
+      | group_by(.turn_id)
+      | map(max_by(.timestamp))
+      | sort_by(.timestamp) | reverse
+      | .[:$limit]
+      | map(. + {
+          short_id: ("T-" + .turn_id[-8:]),
+          short_root_id:
+            (
+              if .root_turn_id != .turn_id then
+                ("T-" + .root_turn_id[-8:])
+              elif (.session_id | length) > 0 then
+                ("S-" + .session_id[-8:])
+              else
+                "-"
+              end
+            )
+        })
+    ' > "$tmp"
 
 if [[ "$output_mode" == "json" ]]; then
-  jq -Rn '
-    [inputs
-      | split("\t")
-      | {
-          timestamp: .[0],
-          short_id: .[1],
-          turn_id: .[2],
-          root_turn_id: .[3],
-          short_root_id: .[4],
-          session_id: .[5]
-        }
-    ]
-  ' < "$tmp"
+  cat "$tmp"
   exit 0
 fi
 
-printf "%-22s %-11s %-11s %-38s %-38s\n" \
-  "TIME" "SHORT-ID" "ROOT-ID" "SESSION-ID" "TURN-ID"
+printf "%-22s %-11s %-11s %-38s %-38s %-24s %s\n" \
+  "TIME" "SHORT-ID" "ROOT-ID" "SESSION-ID" "TURN-ID" "MODEL" "SOURCE"
 
-while IFS=$'\t' read -r ts short turn root short_root session; do
-  [[ -n "$turn" ]] || continue
-  printf "%-22s %-11s %-11s %-38s %-38s\n" \
-    "$ts" "$short" "$short_root" "${session:--}" "$turn"
-done < "$tmp"
+jq -r '.[] | [
+  .timestamp,
+  .short_id,
+  .short_root_id,
+  (.session_id // ""),
+  .turn_id,
+  (.model // ""),
+  (.source // "")
+] | @tsv' "$tmp" |
+while IFS=$'\t' read -r ts short root session turn model source; do
+  printf "%-22s %-11s %-11s %-38s %-38s %-24s %s\n" \
+    "$ts" "$short" "$root" "${session:--}" "$turn" "${model:--}" "${source:--}"
+done

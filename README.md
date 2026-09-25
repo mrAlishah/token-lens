@@ -59,6 +59,15 @@ token-lens usage --provider all \
 
 With `--provider all`, text output is rendered in separate `CODEX` and `CLAUDE` sections. `--json` returns a provider-keyed object.
 
+Both turn lists use the same columns:
+
+```text
+TIME  SHORT-ID  ROOT-ID  SESSION-ID  TURN-ID  MODEL  SOURCE
+```
+
+`SOURCE` is the project/repository working directory recorded by the provider when available. For Codex, `ROOT-ID` is the short root turn when it differs from the selected turn; when the turn is its own root it shows `S-xxxxxxxx`, the short session ID, instead of repeating `SHORT-ID`. Claude has no equivalent root-turn field in these transcripts, so it also uses `S-xxxxxxxx` in `ROOT-ID`.
+
+
 The original provider-specific commands remain available:
 
 ```bash
