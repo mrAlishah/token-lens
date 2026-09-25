@@ -47,6 +47,12 @@ token-lens usage --provider codex T-3aa6eba0
 token-lens usage --provider claude T-1234abcd
 token-lens usage --provider claude <session-id>
 
+# Numeric record selector: 1 = newest, 2 = second newest, ...
+codex-usage 1
+codex-usage 3
+claude-usage 1
+claude-usage 3
+
 # Both providers: latest turn from each
 token-lens usage --provider all --profile coding
 
@@ -68,15 +74,21 @@ TIME  SHORT-ID  ROOT-ID  SESSION-ID  TURN-ID  MODEL  SOURCE
 `SOURCE` is the project/repository working directory recorded by the provider when available. For Codex, `ROOT-ID` is the short root turn when it differs from the selected turn; when the turn is its own root it shows `S-xxxxxxxx`, the short session ID, instead of repeating `SHORT-ID`. Claude has no equivalent root-turn field in these transcripts, so it also uses `S-xxxxxxxx` in `ROOT-ID`.
 
 
-The original provider-specific commands remain available:
+The original provider-specific commands remain available. Usage commands also accept a positive record number using the same newest-first ordering as the matching `*-turns` command:
 
 ```bash
 codex-turns
+codex-usage 1          # newest Codex turn
+codex-usage 3          # third newest Codex turn
 codex-usage T-3aa6eba0
 
 claude-turns
+claude-usage 1         # newest Claude turn
+claude-usage 3         # third newest Claude turn
 claude-usage T-1234abcd
 ```
+
+If the requested rank is larger than the available turn count, the command exits with a clear `record #N does not exist` error.
 
 ## Profiles
 

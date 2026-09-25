@@ -6,13 +6,15 @@ SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 usage() {
   cat <<'EOF'
 Usage:
-  codex-usage <turn-id> [--profile simple|coding|agentic] [--config <path>] [--no-config] [--json]
+  codex-usage <turn-id|record-number> [--profile simple|coding|agentic] [--config <path>] [--no-config] [--json]
 
 Defaults:
   profile: coding
   config:  ~/.config/token-lens/config.json (optional)
 
 Examples:
+  codex-usage 1
+  codex-usage 3 --profile agentic
   codex-usage T-3aa6eba0
   codex-usage T-3aa6eba0 --profile agentic
   codex-usage T-3aa6eba0 --config ~/.config/token-lens/config.json
@@ -91,6 +93,16 @@ while (( $# > 0 )); do
 done
 
 [[ -n "$requested" ]] || { usage; exit 1; }
+
+# A positive integer means Nth newest turn, using codex-turns ordering.
+if [[ "$requested" =~ ^[0-9]+$ ]]; then
+  (( requested >= 1 )) || die "Record number must be a positive integer."
+  turns_cmd="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/codex-turns"
+  [[ -x "$turns_cmd" ]] || die "codex-turns executable not found: $turns_cmd"
+  ranked_id="$("$turns_cmd" "$requested" --json 2>/dev/null | jq -r --argjson n "$requested" '.[$n - 1].short_id // empty')"
+  [[ -n "$ranked_id" ]] || die "Codex record #$requested does not exist."
+  requested="$ranked_id"
+fi
 
 config_source="built-in defaults"
 if [[ "$config_mode" != "disabled" ]]; then
