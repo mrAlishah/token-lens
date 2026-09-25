@@ -41,6 +41,26 @@
         "input_tokens": 10,
         "reasoning_output_tokens": 10,
         "turns": 5
+      },
+      "health": {
+        "context_window_tokens": 400000,
+        "cost_equivalent_per_turn": {
+          "great_lt": 60000,
+          "good_lt": 150000,
+          "watch_lt": 300000
+        },
+        "cache_ratio_percent": {
+          "great_gte": 75,
+          "good_gte": 50,
+          "watch_gte": 25,
+          "min_turns": 3,
+          "min_input_tokens": 20000
+        },
+        "loop_turns": {
+          "great_lte": 8,
+          "good_lte": 20,
+          "watch_lte": 40
+        }
       }
     }
   },
@@ -53,6 +73,26 @@
               "great_lte": 6,
               "good_lte": 16,
               "watch_lte": 30
+            }
+          },
+          "health": {
+            "context_window_tokens": 200000,
+            "cost_equivalent_per_turn": {
+              "great_lt": 60000,
+              "good_lt": 150000,
+              "watch_lt": 300000
+            },
+            "cache_ratio_percent": {
+              "great_gte": 75,
+              "good_gte": 50,
+              "watch_gte": 25,
+              "min_turns": 3,
+              "min_input_tokens": 20000
+            },
+            "loop_turns": {
+              "great_lte": 16,
+              "good_lte": 40,
+              "watch_lte": 80
             }
           }
         }
